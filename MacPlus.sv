@@ -208,11 +208,12 @@ localparam CONF_STR = {
 	"F2,DSK,Mount Sec Floppy;",
 	"-;",
 	"SC0,IMGVHD,Mount SCSI-6;",
-	"SC1,IMGVHD,Mount SCSI-2;",
+	"SC1,IMGVHD,Mount SCSI-5;",
 	"-;",
 	"O78,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"OBC,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
 	"-;",
+	"O9,Model,Plus,SE;",
 	"O5,Speed,8MHz,16MHz;",
 	"ODE,CPU,68000,68010,68020;",
 	"O4,Memory,1MB,4MB;",
@@ -240,6 +241,7 @@ pll pll
 
 reg       status_mem;
 reg [1:0] status_cpu;
+reg       status_mod;
 reg       n_reset = 0;
 always @(posedge clk_sys) begin
 	reg [15:0] rst_cnt;
@@ -254,6 +256,7 @@ always @(posedge clk_sys) begin
 			rst_cnt    <= rst_cnt - 1'd1;
 			status_mem <= status[4];
 			status_cpu <= status[14:13];
+			status_mod <= status[9];
 		end
 		else begin
 			n_reset <= 1;
@@ -263,19 +266,21 @@ end
 
 ///////////////////////////////////////////////////
 
+localparam SCSI_DEVS = 2;
+
 // the status register is controlled by the on screen display (OSD)
 wire [31:0] status;
 wire  [1:0] buttons;
-wire [31:0] sd_lba[2];
-wire  [1:0] sd_rd;
-wire  [1:0] sd_wr;
-wire  [1:0] sd_ack;
-wire  [7:0] sd_buff_addr;
-wire [15:0] sd_buff_dout;
-wire [15:0] sd_buff_din[2];
-wire        sd_buff_wr;
-wire  [1:0] img_mounted;
-wire [31:0] img_size;
+wire [31:0] sd_lba[SCSI_DEVS];
+wire  [SCSI_DEVS-1:0] sd_rd;
+wire  [SCSI_DEVS-1:0] sd_wr;
+wire  [SCSI_DEVS-1:0] sd_ack;
+wire            [7:0] sd_buff_addr;
+wire           [15:0] sd_buff_dout;
+wire           [15:0] sd_buff_din[SCSI_DEVS];
+wire                  sd_buff_wr;
+wire  [SCSI_DEVS-1:0] img_mounted;
+wire           [63:0] img_size;
 
 wire        ioctl_write;
 reg         ioctl_wait = 0;
@@ -289,7 +294,7 @@ wire [15:0] ioctl_data;
 
 wire [32:0] TIMESTAMP;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(2), .WIDE(1)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(SCSI_DEVS), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -422,7 +427,7 @@ wire memoryLatch;
 
 // peripherals
 wire vid_alt, loadPixels, pixelOut, _hblank, _vblank, hsync, vsync;
-wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM;
+wire memoryOverlayOn, selectSCSI, selectSCC, selectIWM, selectVIA, selectRAM, selectROM, selectSEOverlay;
 wire [15:0] dataControllerDataOut;
 
 // audio
@@ -580,7 +585,7 @@ addrController_top ac0
 	._cpuRW(_cpuRW),
 	._cpuAS(_cpuAS),
 	.turbo(status_turbo),
-	.configROMSize(configROMSize), 
+	.configROMSize({status_mod,~status_mod}),
 	.configRAMSize(configRAMSize), 
 	.memoryAddr(memoryAddr),
 	.memoryLatch(memoryLatch),
@@ -598,6 +603,7 @@ addrController_top ac0
 	.selectVIA(selectVIA),
 	.selectRAM(selectRAM),
 	.selectROM(selectROM),
+	.selectSEOverlay(selectSEOverlay),
 	.hsync(hsync), 
 	.vsync(vsync),
 	._hblank(_hblank),
@@ -618,13 +624,14 @@ addrController_top ac0
 wire [1:0] diskEject;
 wire [1:0] diskMotor, diskAct;
 
-dataController_top dc0
+dataController_top #(SCSI_DEVS) dc0
 (
 	.clk32(clk_sys), 
 	.clk8_en_p(clk8_en_p),
 	.clk8_en_n(clk8_en_n),
 	.E_rising(E_rising),
 	.E_falling(E_falling),
+	.machineType(status_mod),
 	._systemReset(n_reset),
 	._cpuReset(_cpuReset), 
 	._cpuIPL(_cpuIPL),
@@ -641,6 +648,7 @@ dataController_top dc0
 	.selectSCC(selectSCC),
 	.selectIWM(selectIWM),
 	.selectVIA(selectVIA),
+	.selectSEOverlay(selectSEOverlay),
 	.cpuBusControl(cpuBusControl),
 	.videoBusControl(videoBusControl),
 	.memoryDataOut(memoryDataOut),
@@ -686,17 +694,15 @@ dataController_top dc0
 
 	// block device interface for scsi disk
 	.img_mounted(img_mounted),
-	.img_size(img_size),
-	.io_lba0(sd_lba[0]),
-	.io_lba1(sd_lba[1]),
+	.img_size(img_size[40:9]),
+	.io_lba(sd_lba),
 	.io_rd(sd_rd),
 	.io_wr(sd_wr),
 	.io_ack(sd_ack),
 
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din0(sd_buff_din[0]),
-	.sd_buff_din1(sd_buff_din[1]),
+	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr)
 );
 
@@ -771,10 +777,10 @@ always @(posedge clk_sys) begin
 	
 	if(ioctl_write) begin
 		dio_data <= {ioctl_data[7:0], ioctl_data[15:8]};
-		dio_a <= {dio_index[1:0], dio_addr[18:0]};
+		dio_a <= dio_index[1:0] ? {dio_index[1:0], dio_addr[18:0]} : {dio_index[6], dio_addr[17:0]};
 		ioctl_wait <= 1;
 	end
-	
+
 	old_cyc <= dioBusControl;
 	if(~dioBusControl) dio_write <= ioctl_wait;
 	if(old_cyc & ~dioBusControl & dio_write) ioctl_wait <= 0;
@@ -786,7 +792,7 @@ wire download_cycle = dio_download && dioBusControl;
 
 ////////////////////////// SDRAM /////////////////////////////////
 
-wire [24:0] sdram_addr = download_cycle ? { 4'b0001, dio_a[20:0] } : { 3'b000, ~_romOE, memoryAddr[21:1] };
+wire [24:0] sdram_addr = download_cycle ? { 4'b0001, dio_a[20:0] } : { 3'b000, ~_romOE, _romOE ? memoryAddr[21:19] : {2'b00,status_mod}, memoryAddr[18:1] };
 wire [15:0] sdram_din  = download_cycle ? dio_data              : memoryDataOut;
 wire  [1:0] sdram_ds   = download_cycle ? 2'b11                 : { !_memoryUDS, !_memoryLDS };
 wire        sdram_we   = download_cycle ? dio_write             : !_ramWE;
