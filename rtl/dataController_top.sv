@@ -66,6 +66,7 @@ module dataController_top(
 	output [10:0] audioOut,  // 8 bit audio + 3 bit volume
 	output snd_alt,
 	input loadSound,
+	input snd_advance,
 	
 	// misc
 	output memoryOverlayOn,
@@ -95,29 +96,46 @@ module dataController_top(
 	
 	parameter SCSI_DEVS = 2;
 	
-	// add binary volume levels according to volume setting
-	assign audioOut = 
-		(snd_vol[0]?audio_x1:11'd0) +
-		(snd_vol[1]?audio_x2:11'd0) +
-		(snd_vol[2]?audio_x4:11'd0);
-
-	// three binary volume levels *1, *2 and *4, sign expanded
-	wire [10:0] audio_x1 = { {3{audio_latch[7]}}, audio_latch };
-	wire [10:0] audio_x2 = { {2{audio_latch[7]}}, audio_latch, 1'b0 };
-	wire [10:0] audio_x4 = {    audio_latch[7]  , audio_latch, 2'b00};
+	// Volume: snd_vol[2:0] is a 3-bit binary level (0=mute, 7=max).
+	// The original code summed scaled copies (x1+x2+x4) which is mathematically
+	// equivalent to multiplying by snd_vol. Replaced with explicit signed multiply
+	// for clarity. Range: [-128..+127] * [0..7] = [-896..+889], fits in [10:0].
+	assign audioOut = $signed(audio_latch) * $signed({1'b0, snd_vol});
 	
 	reg loadSoundD;
 	always @(posedge clk32)
 		if (clk8_en_n) loadSoundD <= loadSound;
 
-	// read audio data and convert to signed for further volume adjustment
-	reg [7:0] audio_latch;
+	// Pre-latch audio scheme:
+	// The SDRAM reads audioAddr at sndReadAck rate (every 16 clk8), but the
+	// Bresenham divider advances audioAddr at clk8 granularity (~366 clk8 spacing).
+	// Without the pre-latch, audio_sample would update at sndReadAck time, causing
+	// output sample spacing to alternate between 352 and 368 clk8 (±2.2% jitter).
+	//
+	// With the pre-latch: audio_prebuf captures SDRAM data at sndReadAck rate
+	// (always has the latest sample for the current audioAddr). audio_sample is
+	// committed from audio_prebuf only when snd_advance pulses (Bresenham trigger),
+	// giving output transitions with ±1 clk8 precision — matching real hardware.
+	//
+	// The one-sample latency (audio_prebuf contains sample[N-1] when addr advances
+	// to N) is a constant delay, inaudible, and matches real hardware where the
+	// sample is read and used within the same line period.
+	reg [7:0] audio_prebuf;
+	reg [7:0] audio_sample;
+
 	always @(posedge clk32) begin
-		if(clk8_en_p && loadSoundD) begin
-			if(snd_ena) audio_latch <= 8'h7f; // when disabled, drive output high
-			else  	 	audio_latch <= memoryDataIn[15:8] - 8'd128;
-		end
+		// Pre-buffer: continuously capture SDRAM data at sndReadAck rate
+		if(clk8_en_p && loadSoundD)
+			audio_prebuf <= memoryDataIn[15:8] - 8'd128;
+
+		// Commit: transfer pre-buffer to output at Bresenham trigger time
+		if(clk8_en_p && snd_advance)
+			audio_sample <= audio_prebuf;
 	end
+
+	// Combinational override: snd_ena forces output to +127 immediately,
+	// matching the real ASG PAL behavior (no ~45µs delay).
+	wire [7:0] audio_latch = snd_ena ? 8'h7f : audio_sample;
 	
 	// CPU reset generation
 	// For initial CPU reset, RESET and HALT must be asserted for at least 100ms = 800,000 clocks of clk8
