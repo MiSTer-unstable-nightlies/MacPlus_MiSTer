@@ -34,6 +34,12 @@ module iwm
 	input clk,
 	input cep,
 	input cen,
+	// clk16_en_n + the turbo flag, used ONLY to scale the read-data latch
+	// clear interval with CPU speed - see readLatchClearTimer below. Every
+	// other IWM timing stays on cep/cen at 8 MHz, including the 16 us disk
+	// byte rate, which is a property of the drive and must not scale.
+	input cen16,
+	input turbo,
 
 	input _reset,
 	input selectIWM,
@@ -56,7 +62,31 @@ module iwm
 	input dskReadAckInt,
 	output [21:0] dskReadAddrExt,
 	input dskReadAckExt,
-	input [7:0] dskReadData
+	input [7:0] dskReadData,
+
+	// floppy write path
+	input [1:0] writeProtect, // {ext,int} - OSD toggle ANDed with img_readonly, per drive
+
+	output [21:0] dskWriteAddrInt,
+	output [15:0] dskWriteDataInt,
+	output        dskWriteReqInt,
+	input         dskWriteAckInt,
+	output [21:0] dskWriteAddrExt,
+	output [15:0] dskWriteDataExt,
+	output        dskWriteReqExt,
+	input         dskWriteAckExt,
+
+	// SD persistence tap, per drive - see floppy.v's dskCommit* ports
+	output        dskCommitDoneInt,
+	output [21:0] dskCommitAddrInt,
+	output        dskCommitBufWrInt,
+	output [7:0]  dskCommitBufAddrInt,
+	output [15:0] dskCommitBufDataInt,
+	output        dskCommitDoneExt,
+	output [21:0] dskCommitAddrExt,
+	output        dskCommitBufWrExt,
+	output [7:0]  dskCommitBufAddrExt,
+	output [15:0] dskCommitBufDataExt
 );
 
 	wire [7:0] dataInLo = dataIn[7:0];
@@ -67,11 +97,13 @@ module iwm
 	reg ca0, ca1, ca2, lstrb, selectExternalDrive, q6, q7;
 	reg ca0Next, ca1Next, ca2Next, lstrbNext, selectExternalDriveNext, q6Next, q7Next;
 	wire advanceDriveHead; // prevents overrun when debugging, does not exit on a real Mac!
-	reg [7:0] writeData;
 	reg [7:0] readDataLatch;
 	wire _iwmBusy, _writeUnderrun;
-	assign _iwmBusy = 1'b1; // for writes, a value of 1 here indicates the IWM write buffer is empty
-	assign _writeUnderrun = 1'b1;
+	// for writes, a value of 1 here indicates the IWM write buffer is empty -
+	// muxed from whichever drive is currently selected, mirroring readData/
+	// newByteReady below. See floppy.v's writeBusy/writeUnderrun comment.
+	assign _iwmBusy       = ~(selectExternalDrive ? writeBusyExt : writeBusyInt);
+	assign _writeUnderrun = ~(selectExternalDrive ? writeUnderrunExt : writeUnderrunInt);
 
 	// floppy disk drives 
 	reg diskEnableExt, diskEnableInt;
@@ -82,7 +114,18 @@ module iwm
 	wire newByteReadyExt;
 	wire [7:0] readDataExt;
 	wire senseExt = readDataExt[7]; // bit 7 doubles as the sense line here
-	
+
+	// write path: which drive's data register a CPU write targets follows
+	// selectExternalDriveNext, mirroring q7Next/q6Next's use below for the
+	// same in-flight access (see the "write IWM state" block further down).
+	wire dataRegWrite = (_cpuRW == 1'b0) && selectIWM && (_cpuLDS == 1'b0) &&
+	                    ({q7Next, q6Next} == 2'b11) && (diskEnableExt | diskEnableInt);
+	wire writeReqInt = cen && dataRegWrite && !selectExternalDriveNext;
+	wire writeReqExt = cen && dataRegWrite &&  selectExternalDriveNext;
+
+	wire writeBusyInt, writeUnderrunInt;
+	wire writeBusyExt, writeUnderrunExt;
+
 	floppy floppyInt
 	(
 		.clk(clk),
@@ -96,22 +139,41 @@ module iwm
 		.SEL(SEL),
 		.lstrb(lstrb),
 		._enable(~(diskEnableInt & driveSel)),
-		.writeData(writeData),
+		// dataInLo directly, not a registered copy: writeReqInt pulses the
+		// same cycle a register load from dataInLo would be scheduled, and
+		// nonblocking assignments only see pre-edge values, so a register
+		// read here would lag the strobe by one cycle.
+		.writeData(dataInLo),
 		.readData(readDataInt),
 		.advanceDriveHead(advanceDriveHead),
 		.newByteReady(newByteReadyInt),
 		.insertDisk(insertDisk[0]),
 		.diskSides(diskSides[0]),
-		.diskEject(diskEject[0]),	
+		.diskEject(diskEject[0]),
 
 		.motor(diskMotor[0]),
 		.act(diskAct[0]),
 
 		.dskReadAddr(dskReadAddrInt),
 		.dskReadAck(dskReadAckInt),
-		.dskReadData(dskReadData)
+		.dskReadData(dskReadData),
+
+		.writeReq(writeReqInt),
+		.writeProtect(writeProtect[0]),
+		.writeBusy(writeBusyInt),
+		.writeUnderrun(writeUnderrunInt),
+		.dskWriteAddr(dskWriteAddrInt),
+		.dskWriteData(dskWriteDataInt),
+		.dskWriteReq(dskWriteReqInt),
+		.dskWriteAck(dskWriteAckInt),
+
+		.dskCommitDone(dskCommitDoneInt),
+		.dskCommitAddr(dskCommitAddrInt),
+		.dskCommitBufWr(dskCommitBufWrInt),
+		.dskCommitBufAddr(dskCommitBufAddrInt),
+		.dskCommitBufData(dskCommitBufDataInt)
 	);
-		
+
 	floppy floppyExt
 	(
 		.clk(clk),
@@ -125,25 +187,46 @@ module iwm
 		.SEL(SEL),
 		.lstrb(lstrb),
 		._enable(~diskEnableExt),
-		.writeData(writeData),
+		.writeData(dataInLo), // see floppyInt's writeData comment above
 		.readData(readDataExt),
 		.advanceDriveHead(advanceDriveHead),
 		.newByteReady(newByteReadyExt),
 		.insertDisk(insertDisk[1]),
 		.diskSides(diskSides[1]),
 		.diskEject(diskEject[1]),
-		
+
 		.motor(diskMotor[1]),
 		.act(diskAct[1]),
 
 		.dskReadAddr(dskReadAddrExt),
 		.dskReadAck(dskReadAckExt),
-		.dskReadData(dskReadData)
+		.dskReadData(dskReadData),
+
+		.writeReq(writeReqExt),
+		.writeProtect(writeProtect[1]),
+		.writeBusy(writeBusyExt),
+		.writeUnderrun(writeUnderrunExt),
+		.dskWriteAddr(dskWriteAddrExt),
+		.dskWriteData(dskWriteDataExt),
+		.dskWriteReq(dskWriteReqExt),
+		.dskWriteAck(dskWriteAckExt),
+
+		.dskCommitDone(dskCommitDoneExt),
+		.dskCommitAddr(dskCommitAddrExt),
+		.dskCommitBufWr(dskCommitBufWrExt),
+		.dskCommitBufAddr(dskCommitBufAddrExt),
+		.dskCommitBufData(dskCommitBufDataExt)
 	);
-	
+
 	wire [7:0] readData = selectExternalDrive ? readDataExt : readDataInt;
 	wire newByteReady = selectExternalDrive ? newByteReadyExt : newByteReadyInt;
 	
+	// NOTE: iwmMode is DEAD - it is written below and read back in the status
+	// register, but no bit of it affects behaviour anywhere. In particular
+	// its L (latch mode) bit is the real IWM control that governs the
+	// read-data latch hold time implemented by readLatchClearTimer further
+	// down; we always behave as L=1 (Macintosh mode) regardless of what the
+	// driver writes here. Do not assume this register is honoured.
 	reg [4:0] iwmMode;
 	/* IWM mode register: S C M H L
  	 S	Clock speed:
@@ -250,19 +333,20 @@ module iwm
 	end
 
 	// write IWM state
+	// Note: the write-data-register case (diskEnableExt|diskEnableInt) is
+	// handled directly by writeReqInt/Ext + dataInLo above (floppy.v does
+	// its own byte capture), not by a register here - see the writeData
+	// port comment on the floppy instances above for why.
 	always @(posedge clk or negedge _reset) begin
-		if (_reset == 1'b0) begin		
+		if (_reset == 1'b0) begin
 			iwmMode <= 0;
-			writeData <= 0;
 		end
 		else if(cen) begin
 			if (_cpuRW == 0 && selectIWM == 1'b1 && _cpuLDS == 1'b0) begin
 				// writing to any IWM address modifies state as selected by Q7 and Q6
 				case ({q7Next,q6Next})
 					2'b11: begin
-						if (diskEnableExt | diskEnableInt)
-							writeData <= dataInLo;
-						else
+						if (~(diskEnableExt | diskEnableInt))
 							iwmMode <= dataInLo[4:0];
 					end
 				endcase
@@ -272,32 +356,77 @@ module iwm
 
 	// Manage incoming bytes from the disk drive
 	wire iwmRead = (_cpuRW == 1'b1 && selectIWM == 1'b1 && _cpuLDS == 1'b0);
-	reg [3:0] readLatchClearTimer; 
+	reg [3:0] readLatchClearTimer;
+
+	// The latch-clear countdown must scale with CPU speed, or 16 MHz cannot
+	// read disks at all. The .Sony driver detects a new byte only by polling
+	// bit 7, and EVERY GCR disk byte has bit 7 set, so a latch that has not
+	// self-cleared yet is indistinguishable from a fresh byte. Its poll loops
+	// are unrolled double reads ~16 CPU cycles apart (boot1.rom @ 0x03552e):
+	// 2.0 us at 8 MHz, but only 1.0 us at 16 MHz. Ticking this timer on cen
+	// (125 ns) either way puts the clear at a fixed 1.5 us wall-clock, so
+	// 8 MHz clears in time with ~33% margin while 16 MHz never does - the
+	// driver ingests duplicate bytes and every checksum fails.
+	//
+	// Ticking on cen16 (62.5 ns) when turbo restores the same ~33% margin
+	// (12 ticks = 0.75 us vs a 1.0 us gap). At 8 MHz cen16Ce reduces to cen
+	// exactly, so that path stays bit-identical to the hardware-proven
+	// behaviour. Only the clear interval moves; the byte rate does not.
+	//
+	// The clear itself has to run on the SAME enable as the countdown. cen16
+	// is a superset of cen (busPhase[0] vs busPhase==01), so a timer ticking
+	// at cen16 can pass through 1 on a phase-11 tick that cen never sees -
+	// gating the clear on cen alone would let the terminal count slip past
+	// unnoticed and the latch would never clear at all.
+	wire latchClearCe = turbo ? cen16 : cen;
+
 	always @(posedge clk or negedge _reset) begin
-		if (_reset == 1'b0) begin	
+		if (_reset == 1'b0) begin
 			readDataLatch <= 0;
 			readLatchClearTimer <= 0;
-		end 
-		else if(cen) begin
+		end
+		else begin
 			// a countdown timer governs how long after a data latch read before the latch is cleared
-			if (readLatchClearTimer != 0) begin
-				readLatchClearTimer <= readLatchClearTimer - 1'b1;
+			if (latchClearCe) begin
+				if (readLatchClearTimer != 0) begin
+					readLatchClearTimer <= readLatchClearTimer - 1'b1;
+				end
 			end
 
-			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch
-			if (iwmRead && readDataLatch[7]) begin
-				readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
+			// the conclusion of a valid CPU read from the IWM will start the timer to clear the latch.
+			// Ordered after the decrement so a reload still wins when both fire on the same edge,
+			// exactly as it did when both lived in one cen-gated block.
+			//
+			// The RELOAD must run on latchClearCe too, not cen. cen is one tick
+			// per CPU cycle at 8 MHz but only one per TWO CPU cycles at 16 MHz,
+			// so gating the reload on it snaps the start of the countdown to a
+			// 2-cycle grid while the countdown itself ticks every cycle - the
+			// hold then comes out 1 cycle longer or shorter depending on where
+			// the access landed in busPhase. That is not harmless jitter: a poll
+			// that reads a stale latch re-arms this very timer, so losing the
+			// race once pins the latch high for as long as the driver keeps
+			// polling. cpu_en_p/n derive from the same busPhase counter, so the
+			// alignment never drifts - it is fixed by the wait-stated accesses
+			// preceding the poll loop and then stays put, which is why the
+			// failure looks random between runs but sticks within one.
+			if (latchClearCe) begin
+				if (iwmRead && readDataLatch[7]) begin
+					readLatchClearTimer <= 4'hD; // clear latch 14 clocks after the conclusion of a valid read
+				end
 			end
 
 			// when the drive indicates that a new byte is ready, latch it
 			// NOTE: the real IWM must self-synchronize with the incoming data to determine when to latch it
-			if (newByteReady) begin
+			if (cen && newByteReady) begin
 				readDataLatch <= readData;
 			end
-			else if (readLatchClearTimer == 1'b1) begin
+			else if (latchClearCe && readLatchClearTimer == 4'd1) begin
 				readDataLatch <= 0;
 			end
 		end
 	end
+	// Inert: floppy.v hardwires readyToAdvanceHead to 1 ("TEMP: treat IWM as
+	// always ready"), so nothing consumes this. Noted because it is derived
+	// from the now-speed-scaled timer and would otherwise look load-bearing.
 	assign advanceDriveHead = readLatchClearTimer == 1'b1; // prevents overrun when debugging, does not exist on a real Mac!
 endmodule

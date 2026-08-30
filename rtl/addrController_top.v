@@ -59,7 +59,27 @@ module addrController_top(
 	input [21:0] dskReadAddrInt,
 	output dskReadAckInt,
 	input [21:0] dskReadAddrExt,
-	output dskReadAckExt
+	output dskReadAckExt,
+
+	// interface for floppy_loader to write a mounted image into ram.
+	// Shares the previously-unused extra slot 3; int is fixed priority over
+	// ext on simultaneous requests (a concurrent dual mount only serializes
+	// the first few words, since each loader's own address only advances on
+	// its own ack). Write DATA is not routed through here - this module is
+	// address/control only, matching dskReadAddr*/dskReadAck* above - MacPlus.sv
+	// muxes the actual word using these same ack pulses.
+	input [21:0] dskLoadAddrInt,
+	input dskLoadReqInt,
+	output dskLoadAckInt,
+	input [21:0] dskLoadAddrExt,
+	input dskLoadReqExt,
+	output dskLoadAckExt,
+	output dskLoadWrEn,
+	// held for the whole grant cycle (unlike dskLoadAckInt/Ext, which pulse
+	// only in busPhase 3) - MacPlus.sv needs this, not the ack pulses, to
+	// mux which loader's write DATA reaches sdram.v, since that data must
+	// be stable through busPhase 1 (CAS), not just busPhase 3.
+	output dskLoadSelExt
 );
 
 	// -------------- audio engine ---------------
@@ -202,10 +222,42 @@ module addrController_top(
 	assign dskReadAckExt = (extraBusControl == 1'b1) && (extra_slot_count == 1);
 	// audio gets extra slot 2
 	wire sndReadAck    = (extraBusControl == 1'b1) && (extra_slot_count == 2);
+	// floppy image loader (mount-time SD->SDRAM copy) gets the previously
+	// unused extra slot 3. Fixed priority: int over ext.
+	//
+	// sdram.v does not latch a memory cycle in one shot: it issues ACTIVE
+	// (row/bank, plus the oe/we decision) from the signal values present
+	// during busPhase 0, then WRITE (column address AND write data) from the
+	// values present one clk_sys cycle later, in busPhase 1. Every memory
+	// control signal must therefore be stable for the WHOLE four-phase bus
+	// cycle - which is why MacPlus.sv's ROM download path only ever changes
+	// dio_write while ~dioBusControl, and why dskReadAck* below are asserted
+	// for a whole cycle rather than pulsed.
+	//
+	// So: sample the loader requests once at the cycle boundary and hold the
+	// grant (and hence dskLoadWrEn and the memoryAddr mux) for the entire
+	// cycle, and make the ack a late pulse in busPhase 3. A combinational
+	// grant with a cycle-wide ack would let the loader drop wr_req at the
+	// start of busPhase 1 - after RAS had committed the write, but before CAS
+	// sampled the column address and data, so every word landed at a wrong
+	// column with the CPU's data bus contents instead of the disk byte.
+	reg dskLoadReqIntR, dskLoadReqExtR;
+	always @(posedge clk) if (busPhase == 2'b11) begin
+		dskLoadReqIntR <= dskLoadReqInt;
+		dskLoadReqExtR <= dskLoadReqExt;
+	end
 
-	assign memoryAddr = 
+	assign dskLoadSelExt = ~dskLoadReqIntR & dskLoadReqExtR;
+	wire dskLoadGrant  = (extraBusControl == 1'b1) && (extra_slot_count == 3) && (dskLoadReqIntR | dskLoadReqExtR);
+	wire dskLoadAck    = dskLoadGrant && (busPhase == 2'b11);
+	assign dskLoadAckInt = dskLoadAck & ~dskLoadSelExt;
+	assign dskLoadAckExt = dskLoadAck &  dskLoadSelExt;
+	assign dskLoadWrEn   = dskLoadGrant;
+
+	assign memoryAddr =
 		dskReadAckInt ? dskReadAddrInt + 22'h100000:   // first dsk image at 1MB
 		dskReadAckExt ? dskReadAddrExt + 22'h200000:   // second dsk image at 2MB
+		dskLoadGrant  ? (dskLoadSelExt ? dskLoadAddrExt + 22'h200000 : dskLoadAddrInt + 22'h100000) :
 		macAddr;
 
 	// address decoding
