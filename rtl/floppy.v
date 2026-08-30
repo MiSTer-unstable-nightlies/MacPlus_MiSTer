@@ -70,10 +70,10 @@ module floppy
 	input ca2,				// PH2
 	input SEL, 				// HDSEL from VIA
 	input lstrb,			// aka PH3
-	input _enable, 			
-	input [7:0] writeData,		
+	input _enable,
+	input [7:0] writeData,
 	output [7:0] readData,
-	
+
 	input advanceDriveHead,  // prevents overrun when debugging, does not exist on a real Mac!
 	output reg newByteReady,
 	input insertDisk,
@@ -85,7 +85,27 @@ module floppy
 
 	output [21:0] dskReadAddr,
 	input dskReadAck,
-	input [7:0] dskReadData
+	input [7:0] dskReadData,
+
+	// floppy write path
+	input writeReq,        // pulse: CPU registered a new byte in the IWM write-data register
+	input writeProtect,    // 1 = writes refused for this drive (OSD toggle ANDed with img_readonly)
+	output writeBusy,      // 1 = write buffer full, mac must wait (iwm.v inverts for _iwmBusy)
+	output writeUnderrun,  // 1 = an in-flight write byte was abandoned (iwm.v inverts for _writeUnderrun)
+
+	output [21:0] dskWriteAddr,
+	output [15:0] dskWriteData,
+	output        dskWriteReq,
+	input         dskWriteAck,
+
+	// SD persistence tap: mirrors the
+	// SDRAM commit above so a floppy_sd_writer instance outside this
+	// module can build a byte-exact shadow of the committed sector.
+	output        dskCommitDone,   // one clk pulse: sector fully committed to SDRAM
+	output [21:0] dskCommitAddr,   // image byte offset of sector byte 0, valid at dskCommitDone
+	output        dskCommitBufWr,
+	output [7:0]  dskCommitBufAddr,
+	output [15:0] dskCommitBufData
 );
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
@@ -107,10 +127,10 @@ module floppy
 		1'b0, // RDDATA1
 		1'b0, // RDDATA0
 		driveRegs[`DRIVE_REG_TACH], // TACH: 60 pules for each rotation of the drive motor
-		1'b0, // disk switched?
+		diskSwitched, // disk switched?
 		~(driveTrack == 7'h00), // TK0: track 0 indicator
 		driveRegs[`DRIVE_REG_MOTORON], // motor on
-		1'b0, // WRTPRT = locked
+		~writeProtect, // WRTPRT: 0 = locked, 1 = write enabled
 		1'b1, // STEP = complete
 		driveRegs[`DRIVE_REG_CSTIN], // disk in drive
 		driveRegs[`DRIVE_REG_DIRTN] // step direction
@@ -145,9 +165,195 @@ module floppy
 		.idata   ( dskReadDataLatch ),
 		.odata   ( dskReadDataEnc )
 	);
-	
+
 	// TODO: auto-detect doubleSidedDisk from image file size
 	wire doubleSidedDisk = diskSides;
+
+	// ---------------------------------------------------------------------
+	// Write path.
+	//
+	// CPU-supplied bytes are paced at the same 128-clk8 (16us) byte time as
+	// the read side's diskDataByteTimer below, then handed to
+	// floppy_track_decoder. A completed, checksum-valid sector is drained
+	// to SDRAM by floppy_write_committer over the same shared extra-slot-3
+	// port floppy_loader.v uses for mounting - loader and committer never
+	// contend in practice (loader only runs at mount, committer only after
+	// a write completes), and MacPlus.sv gives the loader fixed priority
+	// on the rare chance they do overlap.
+	//
+	// writeUnderrun is a real signal, not a hardwired constant, but this
+	// synchronous byte-at-a-time replica has only one path that can
+	// meaningfully raise it: the drive being deselected/disabled with a
+	// byte still in flight (abandoned before its 16us window completed).
+	// A true "CPU too slow to supply the next byte" underrun has no
+	// independent clock to detect against in this model, the same
+	// idealization already accepted on the read side (see
+	// advanceDriveHead's comment above).
+	reg        writeBusyReg;
+	reg [6:0]  writeByteTimer;
+	reg [7:0]  pendingWriteByte;
+	reg        writeUnderrunReg;
+	reg        decReady;
+
+	assign writeBusy     = writeBusyReg;
+	assign writeUnderrun = writeUnderrunReg;
+
+	// Any disk change - an OS-driven eject or a fresh HPS/OSD mount - must
+	// not let a field the decoder/committer had half-decoded for the
+	// departing image be completed by bytes belonging to the next one
+	// (which would commit a mixed sector). ejectPulse mirrors the exact
+	// eject-detect condition the CSTIN write-register block below uses.
+	// insertDisk itself is a LEVEL held high for as long as a disk stays
+	// mounted (see MacPlus.sv: dsk_int_ins/dsk_ext_ins are registers set on
+	// ldr_*_done and cleared only on eject/remount), not a one-shot mount
+	// pulse, so the actual "a new image just landed" event is its rising
+	// edge - same idiom as lstrbEdge just below.
+	// Reset to a CONSTANT 1, which happens to be exactly the "suppress the
+	// spurious edge" behaviour wanted here: a plain reset with a disk
+	// already mounted - the common case, e.g. a Mac "Reset & Apply" - must
+	// not manufacture an edge the instant reset lifts, which would
+	// otherwise land on (and swallow) the very first legitimate write byte
+	// via the branch below. With prev=1 and insertDisk=1 there is no edge;
+	// with no disk mounted insertDisk is 0 so there is no edge either, and
+	// prev tracks down to 0 on the first cep so a LATER real mount still
+	// produces a proper one.
+	//
+	// An earlier version seeded this from the live insertDisk level inside
+	// the reset branch. Verilog accepts that and Icarus simulates it, but
+	// an asynchronous reset must resolve to a constant: Quartus cannot
+	// build an async LOAD, so it split the register into a flop plus a
+	// transparent latch (Warning 13004/13310, both drive instances) and
+	// TimeQuest then reported the result as a combinational loop it was
+	// "analyzing as a latch" - i.e. untimed logic, powering up undefined,
+	// feeding writePathReset below. Do not reintroduce a non-constant here.
+	reg insertDiskPrev;
+	always @(posedge clk or negedge _reset)
+		if (!_reset)   insertDiskPrev <= 1'b1;
+		else if (cep)  insertDiskPrev <= insertDisk;
+	wire insertDiskEdge = insertDisk && !insertDiskPrev;
+	wire insertDiskFall = !insertDisk && insertDiskPrev;
+
+	wire ejectPulse = cep && _enable == 1'b0 && lstrbEdge == 1'b1 &&
+	                   driveWriteAddr == `DRIVE_REG_EJECT && ca2 == 1'b1;
+
+	// Both EDGES of insertDisk matter, not just the rising one. insertDisk
+	// drops at img_mounted (the loader starting to stream a new image into
+	// SDRAM) and only rises again at ldr_*_done. Resetting on the rising
+	// edge alone left the whole load window - hundreds of ms for an 800K
+	// image - with the departing disk's half-decoded field still sitting in
+	// dec, and a byte already in the 16us pacer could be the very DE/AA
+	// that completes it, committing the old disk's sector into the newly
+	// mounted image. The falling edge discards that field (and the in-
+	// flight byte) the moment the image starts changing underneath it.
+	wire writePathReset = ejectPulse || (cep && (insertDiskEdge || insertDiskFall));
+
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			writeBusyReg     <= 1'b0;
+			writeByteTimer   <= 7'd0;
+			pendingWriteByte <= 8'd0;
+			writeUnderrunReg <= 1'b0;
+			decReady         <= 1'b0;
+		end else if (writePathReset) begin
+			// abandon any in-flight write byte, same as the deselect path
+			// below, but triggered by the disk itself changing underneath it
+			writeBusyReg     <= 1'b0;
+			writeByteTimer   <= 7'd0;
+			decReady         <= 1'b0;
+		end else begin
+			decReady <= 1'b0; // default; pulsed for exactly one cep below
+
+			// byte pacing runs on the same clk8 cadence as diskDataByteTimer
+			if (cep && writeBusyReg) begin
+				if (_enable == 1'b1) begin
+					// drive deselected mid-byte: it never reached the media
+					writeBusyReg     <= 1'b0;
+					writeUnderrunReg <= 1'b1;
+				end else if (writeByteTimer == 7'd127) begin
+					writeBusyReg <= 1'b0;
+					decReady     <= 1'b1; // hand this byte to the decoder now
+				end else begin
+					writeByteTimer <= writeByteTimer + 1'b1;
+				end
+			end
+
+			// Byte acceptance happens whenever the IWM registers a new
+			// write-data byte for this drive (iwm.v's writeReq pulses on
+			// `cen`, not `cep` - this is a plain register capture, not an
+			// SDRAM access, so it carries none of addrController_top.v's
+			// 4-phase RAS/CAS discipline). cen and cep never coincide, so
+			// this cannot race the block above.
+			//
+			// insertDisk is checked as well as CSTIN, and they are not
+			// redundant: CSTIN is only ever SET by an explicit OS eject
+			// strobe (see its own block below) and is never restored to
+			// "no disk" on an OSD remount, so through an entire image
+			// reload it still reads "disk present" while insertDisk is
+			// correctly low. Without this term the Mac could keep feeding
+			// write bytes all the way through a swap, and a field
+			// completing then would commit the departing disk's sector
+			// into the newly mounted image - in SDRAM and, via
+			// floppy_sd_writer, into the new .dsk on the SD card.
+			if (writeReq && _enable == 1'b0 && !writeProtect && !writeBusyReg &&
+			    !driveRegs[`DRIVE_REG_CSTIN] && insertDisk) begin
+				pendingWriteByte <= writeData;
+				writeBusyReg     <= 1'b1;
+				writeByteTimer   <= 7'd0;
+				writeUnderrunReg <= 1'b0;
+			end
+		end
+	end
+
+	wire        secValid, secReject;
+	wire [3:0]  secNum;
+	wire [21:0] secAddr;
+	wire [8:0]  wcBufAddr;
+	wire [7:0]  wcBufData;
+
+	floppy_track_decoder dec
+	(
+		.clk          ( clk ),
+		.ready        ( decReady ),
+		.rst          ( !_reset || writePathReset ),
+
+		.side         ( driveSide ),
+		.sides        ( doubleSidedDisk ),
+		.track        ( driveTrack ),
+
+		.idata        ( pendingWriteByte ),
+
+		.sector_valid ( secValid ),
+		.sector       ( secNum ),
+		.addr         ( secAddr ),
+		.reject       ( secReject ),
+
+		.buf_addr     ( wcBufAddr ),
+		.buf_data     ( wcBufData )
+	);
+
+	floppy_write_committer wc
+	(
+		.clk          ( clk ),
+		.rst          ( !_reset || writePathReset ),
+
+		.sector_valid ( secValid ),
+		.sector_addr  ( secAddr ),
+		.buf_addr     ( wcBufAddr ),
+		.buf_data     ( wcBufData ),
+
+		.wr_addr      ( dskWriteAddr ),
+		.wr_data      ( dskWriteData ),
+		.wr_req       ( dskWriteReq ),
+		.wr_ack       ( dskWriteAck ),
+
+		.busy         (  ),
+		.done         ( dskCommitDone ),
+		.committed_addr ( dskCommitAddr ),
+
+		.sd_buf_addr  ( dskCommitBufAddr ),
+		.sd_buf_data  ( dskCommitBufData ),
+		.sd_buf_wr    ( dskCommitBufWr )
+	);
 	
 	wire [3:0] driveReadAddr = {ca2,ca1,ca0,SEL};
 	
@@ -259,8 +465,29 @@ module floppy
 					ejectIndicatorTimer <= ejectIndicatorTimer - 1'b1;
 			end
 		end
-	end									
-									
+	end
+
+	// SWITCHED: set on the same two disk-change events
+	// writePathReset above already reacts to (an OS eject, or a fresh
+	// mount's insertDisk edge), cleared only when the Mac explicitly writes
+	// the reset-disk-switched register (driveWriteAddr==`DRIVE_REG_CSTIN`,
+	// its write-side function per the header table: "writing 1 sets switch
+	// flag to 0"). Previously hardwired to 0 in driveRegsAsRead, and this
+	// write decode existed but was consumed by nothing.
+	reg diskSwitched;
+	always @(posedge clk or negedge _reset) begin
+		if (_reset == 1'b0) begin
+			diskSwitched <= 1'b0;
+		end
+		else if (ejectPulse || (cep && insertDiskEdge)) begin
+			diskSwitched <= 1'b1;
+		end
+		else if (cep && _enable == 1'b0 && lstrbEdge == 1'b1 &&
+		         driveWriteAddr == `DRIVE_REG_CSTIN && ca2 == 1'b1) begin
+			diskSwitched <= 1'b0;
+		end
+	end
+
 	//`define DRIVE_REG_STEP		2  /* R: drive head stepping (1 = complete) */
 												/* W: 0 = step drive head */
 	always @(posedge clk or negedge _reset) begin

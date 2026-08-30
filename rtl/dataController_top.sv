@@ -3,11 +3,13 @@ module dataController_top(
 	input clk32,					// 32.5 MHz pixel clock
 	input clk8_en_p,
 	input clk8_en_n,
+	input clk16_en_n,		// for the IWM read-latch clear only, see iwm.v
 	input E_rising,
 	input E_falling,
-	
+
 	// system control:
 	input machineType, // 0 - Mac Plus, 1 - Mac SE
+	input turbo,			// 16 MHz CPU; scales the IWM read-latch clear
 	input _systemReset,
 
 	// 68000 CPU control:
@@ -16,6 +18,14 @@ module dataController_top(
 
 	// 68000 CPU memory interface:
 	input [15:0] cpuDataIn,
+	// SCSI pseudo-DMA hold-off -> MacPlus.sv withholds DTACK. See ncr5380.sv.
+	output        scsi_bus_hold,
+
+	// CD-DA pair from the SCSI CD target's audio engine. Exact zeros when not
+	// playing; MacPlus.sv sums them into the Mac's audio through rtl/cd_mix.v.
+	output signed [15:0] cd_snd_l,
+	output signed [15:0] cd_snd_r,
+
 	input [3:0] cpuAddrRegHi, // A12-A9
 	input [2:0] cpuAddrRegMid, // A6-A4
 	input [1:0] cpuAddrRegLo, // A2-A1
@@ -81,20 +91,48 @@ module dataController_top(
 	output [21:0] dskReadAddrExt,
 	input dskReadAckExt,
 
+	// floppy write path
+	input [1:0] writeProtect, // {ext,int}
+
+	output [21:0] dskWriteAddrInt,
+	output [15:0] dskWriteDataInt,
+	output        dskWriteReqInt,
+	input         dskWriteAckInt,
+	output [21:0] dskWriteAddrExt,
+	output [15:0] dskWriteDataExt,
+	output        dskWriteReqExt,
+	input         dskWriteAckExt,
+
+	// SD persistence tap, per drive - see iwm.v's dskCommit* ports
+	output        dskCommitDoneInt,
+	output [21:0] dskCommitAddrInt,
+	output        dskCommitBufWrInt,
+	output [7:0]  dskCommitBufAddrInt,
+	output [15:0] dskCommitBufDataInt,
+	output        dskCommitDoneExt,
+	output [21:0] dskCommitAddrExt,
+	output        dskCommitBufWrExt,
+	output [7:0]  dskCommitBufAddrExt,
+	output [15:0] dskCommitBufDataExt,
+
 	// connections to io controller
 	input   [SCSI_DEVS-1:0] img_mounted,
 	input            [31:0] img_size,
+	input                   cd_enable,
 	output           [31:0] io_lba[SCSI_DEVS],
 	output  [SCSI_DEVS-1:0] io_rd,
 	output  [SCSI_DEVS-1:0] io_wr,
 	input   [SCSI_DEVS-1:0] io_ack,
 	input             [7:0] sd_buff_addr,
+	input             [4:0] sd_buff_addr_hi,  // hps_io addr[12:8], CD-DA frames
 	input            [15:0] sd_buff_dout,
 	output           [15:0] sd_buff_din[SCSI_DEVS],
 	input                   sd_buff_wr
 );
 	
 	parameter SCSI_DEVS = 2;
+	// Index of the CD-ROM target inside the SCSI arrays, or SCSI_DEVS for none.
+	parameter SCSI_CD_DEV = SCSI_DEVS;
 	
 	// Volume: snd_vol[2:0] is a 3-bit binary level (0=mute, 7=max).
 	// The original code summed scaled copies (x1+x2+x4) which is mathematically
@@ -187,7 +225,7 @@ module dataController_top(
 	assign memoryDataOut = cpuDataIn;
 
 	// SCSI
-	ncr5380 #(SCSI_DEVS) scsi(
+	ncr5380 #(.DEVS(SCSI_DEVS), .CD_DEV(SCSI_CD_DEV)) scsi(
 		.clk(clk32),
 		.reset(!_cpuReset),
 		.bus_cs(selectSCSI),
@@ -195,18 +233,23 @@ module dataController_top(
 		.ior(!_cpuUDS),
 		.iow(!_cpuLDS),
 		.dack(cpuAddrRegHi[0]),   // A9
+		.bus_hold(scsi_bus_hold),
+		.cd_snd_l(cd_snd_l),
+		.cd_snd_r(cd_snd_r),
 		.wdata(cpuDataIn[15:8]),
 		.rdata(scsiDataOut),
 
 		// connections to io controller
 		.img_mounted( img_mounted ),
 		.img_size( img_size ),
+		.cd_enable( cd_enable ),
 		.io_lba ( io_lba ),
 		.io_rd ( io_rd ),
 		.io_wr ( io_wr ),
 		.io_ack ( io_ack ),
 
 		.sd_buff_addr(sd_buff_addr),
+		.sd_buff_addr_hi(sd_buff_addr_hi),
 		.sd_buff_dout(sd_buff_dout),
 		.sd_buff_din(sd_buff_din),
 		.sd_buff_wr(sd_buff_wr)
@@ -434,6 +477,8 @@ module dataController_top(
 		.clk(clk32),
 		.cep(clk8_en_p),
 		.cen(clk8_en_n),
+		.cen16(clk16_en_n),
+		.turbo(turbo),
 		._reset(_cpuReset),
 		.selectIWM(selectIWM),
 		._cpuRW(_cpuRW),
@@ -453,7 +498,28 @@ module dataController_top(
 		.dskReadAckInt(dskReadAckInt),
 		.dskReadAddrExt(dskReadAddrExt),
 		.dskReadAckExt(dskReadAckExt),
-		.dskReadData(memoryDataIn[7:0])
+		.dskReadData(memoryDataIn[7:0]),
+
+		.writeProtect(writeProtect),
+		.dskWriteAddrInt(dskWriteAddrInt),
+		.dskWriteDataInt(dskWriteDataInt),
+		.dskWriteReqInt(dskWriteReqInt),
+		.dskWriteAckInt(dskWriteAckInt),
+		.dskWriteAddrExt(dskWriteAddrExt),
+		.dskWriteDataExt(dskWriteDataExt),
+		.dskWriteReqExt(dskWriteReqExt),
+		.dskWriteAckExt(dskWriteAckExt),
+
+		.dskCommitDoneInt(dskCommitDoneInt),
+		.dskCommitAddrInt(dskCommitAddrInt),
+		.dskCommitBufWrInt(dskCommitBufWrInt),
+		.dskCommitBufAddrInt(dskCommitBufAddrInt),
+		.dskCommitBufDataInt(dskCommitBufDataInt),
+		.dskCommitDoneExt(dskCommitDoneExt),
+		.dskCommitAddrExt(dskCommitAddrExt),
+		.dskCommitBufWrExt(dskCommitBufWrExt),
+		.dskCommitBufAddrExt(dskCommitBufAddrExt),
+		.dskCommitBufDataExt(dskCommitBufDataExt)
 	);
 
 	// SCC

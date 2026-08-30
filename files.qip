@@ -3,7 +3,14 @@ set_global_assignment -name QIP_FILE rtl/fx68k/fx68k.qip
 set_global_assignment -name VERILOG_FILE rtl/sdram.v
 set_global_assignment -name VERILOG_FILE rtl/scsi.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ncr5380.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cd_audio.sv
+set_global_assignment -name VERILOG_FILE rtl/dc_blocker_slow.v
+set_global_assignment -name VERILOG_FILE rtl/cd_mix.v
 set_global_assignment -name VERILOG_FILE rtl/floppy_track_encoder.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_track_decoder.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_write_committer.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_loader.v
+set_global_assignment -name VERILOG_FILE rtl/floppy_sd_writer.v
 set_global_assignment -name VERILOG_FILE rtl/floppy.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ps2_kbd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/adb.sv
