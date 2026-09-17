@@ -1,66 +1,52 @@
 // floppy_sd_writer.v
 //
-// Persist a checksum-valid, SDRAM-
-// committed sector (see floppy_write_committer.v) out to the mounted
-// .dsk on the SD card, via hps_io's sd_wr/sd_ack/sd_buff_addr block-
-// device protocol.
+// Persist every sector the guest writes out to the mounted .dsk on the SD
+// card, via hps_io's sd_wr/sd_ack/sd_buff_addr block-device protocol.
 //
-// Protocol modelled on scsi.v's io_wr handshake (the only sd_wr producer
-// already proven on this core): assert sd_wr with sd_lba valid, drop
-// sd_wr as soon as sd_ack rises (hps_io has accepted the request and is
-// now stepping sd_buff_addr through the block), then wait for sd_ack to
-// fall again before considering the sector durably handed off - mirroring
-// floppy_loader.v's own SD_WAIT_ACK/SD_WAIT_DONE split for the read side.
-// sd_buff_din for this slot must stay valid, addressed by the HPS-driven
-// shared sd_buff_addr bus, for the whole time sd_ack is high.
+// No copy of the data is kept here: floppy_write_committer.v has already
+// landed the sector in SDRAM, so only the sector NUMBER is queued and the
+// block is fetched from SDRAM at write time, through addrController_top.v's
+// extra-slot-3 read port, into one 256x16 buffer that hps_io streams out.
+// A sector re-committed while still queued is queued and written twice, with
+// the latest data both times. A full queue refuses the push; it never
+// overwrites a block in flight (a fixed-depth copy of the data did, when an
+// O_SYNC card write stalled longer than two sectors).
 //
-// A checksum-valid sector never depends on rotational position, so this
-// module has no notion of "gap" either
-// - the queue below only ever fills on commit_done. It also reacts to
-// img_mounted (eject/remount of THIS slot): the queue is dropped so a
-// sector captured against the old image never lands, at the old image's
-// stale LBA, in whatever gets mounted next - see the img_mounted handling
-// below for why this is safe against an in-flight sd_wr.
+// Protocol modelled on scsi.v's io_wr handshake: assert sd_wr with sd_lba
+// valid, drop sd_wr as soon as sd_ack rises, then wait for sd_ack to fall
+// before considering the sector handed off. sd_buff_din must stay valid,
+// addressed by the HPS-driven sd_buff_addr, for the whole time sd_ack is high.
 //
-// Backpressure: the CPU-facing write path can only produce a new
-// commit_done roughly once per sector's worth of 16us-paced IWM bytes
-// (~700 encoded bytes => >10ms), comfortably longer than a real sd_wr
-// transfer. But an sd_wr can occasionally run long (SD card stalls,
-// wear-levelling, etc.), so a single in-flight slot is not "never drop a
-// commit that arrives while the previous one is in flight" - hence the
-// 2-entry queue below (two independent shadow buffers, ping-ponged by
-// `tail` on capture and drained in order via `head`). A third commit
-// landing before the first of the previous two has finished draining
-// would have nowhere new to go and reuses the still-in-flight buffer -
-// accepted as a documented, not-expected-in-practice limit (the same
-// idealization writeUnderrun and the committer's own single-sector-in-
-// flight assumption already accept elsewhere in this write path), not a
-// silently-corrupting one: capture and drain never touch the same buffer
-// under normal (non-overflowing) operation, so the failure mode is stale
-// data reaching one sd_wr, not a torn transfer.
+// img_mounted (eject/remount of THIS slot) aborts the writer: FSM to idle,
+// both request lines low, queue emptied. sd_ack is shared per slot, so a
+// running FSM would otherwise be walked forward by floppy_loader's acks on
+// the new image.
 module floppy_sd_writer #(
-	parameter ACK_TIMEOUT_BITS = 24 // ~0.5s at clk_sys (~32MHz); sim overrides this narrower
+	parameter ACK_TIMEOUT_BITS = 24, // ~0.5s at clk_sys (~32MHz)
+	parameter QDEPTH_BITS      = 10  // 1024 pending sectors
 ) (
 	input         clk,
 	input         reset,
 
-	input         img_mounted, // this slot's own mount pulse - drop the queue, see header
+	input         img_mounted, // this slot's own mount pulse - abort, see header
 
-	// commit tap from floppy_write_committer, via floppy.v/iwm.v/
+	// commit notice from floppy_write_committer, via floppy.v/iwm.v/
 	// dataController_top.sv's dskCommit* ports
 	input             commit_done,
-	input      [21:0] commit_addr,     // image byte offset of sector byte 0
-	input             commit_buf_wr,
-	input      [7:0]  commit_buf_addr, // word index 0..255
-	input      [15:0] commit_buf_data,
+	input      [21:0] commit_addr,  // image byte offset of sector byte 0
 
 	input             readonly,     // this drive's latched img_readonly - refuse persistence outright
-	input             loader_busy,  // don't start a new sd_wr while floppy_loader owns this slot
+	input             loader_busy,  // don't touch the slot or the image while floppy_loader owns them
 
-	// Size of the mounted image in 512-byte blocks (floppy_loader's own
-	// loaded_size >> 9, latched at that slot's mount). Any commit landing
-	// at or beyond this is dropped rather than written - see P_IDLE.
+	// image length in 512-byte blocks; a commit at or beyond it is dropped
 	input      [12:0] size_blocks,
+
+	// extra-slot-3 read port: hold fetch_req with fetch_addr stable until
+	// the one-clock fetch_ack, on which fetch_data is that word of the image
+	output reg [21:0] fetch_addr,   // byte offset within THIS image, word-aligned
+	output reg        fetch_req,
+	input             fetch_ack,
+	input      [15:0] fetch_data,
 
 	output reg [31:0] sd_lba,
 	output reg        sd_wr,
@@ -72,146 +58,138 @@ module floppy_sd_writer #(
 	output            busy
 );
 
-	// two independent 256x16 shadow sectors - see header for why two.
-	reg [15:0] mem0 [0:255];
-	reg [15:0] mem1 [0:255];
+	// the sector-number queue
+	reg [12:0] q_mem [0:(1<<QDEPTH_BITS)-1];
+	reg [QDEPTH_BITS:0] wr_ptr, rd_ptr;
+	wire [QDEPTH_BITS:0] count = wr_ptr - rd_ptr;
+	wire full  = count[QDEPTH_BITS];
+	wire empty = (count == 0);
+	reg  [12:0] q_head;    // registered read of q_mem[rd_ptr]
+	reg         empty_d;   // q_head lags a push by one cycle; see P_IDLE
 
-	reg        tail;       // buffer currently receiving commit_buf_wr taps
-	reg        head;       // buffer currently queued/draining to sd_wr
-	reg  [1:0] valid;      // per-buffer: queued or in-flight, not yet drained
-	reg [21:0] addr_q [0:1];
+	wire accept = commit_done && !readonly;
+	wire push   = accept && !full;
 
 	always @(posedge clk) begin
-		if (commit_buf_wr) begin
-			if (tail == 1'b0) mem0[commit_buf_addr] <= commit_buf_data;
-			else              mem1[commit_buf_addr] <= commit_buf_data;
-		end
+		if (push) q_mem[wr_ptr[QDEPTH_BITS-1:0]] <= commit_addr[21:9];
+		q_head  <= q_mem[rd_ptr[QDEPTH_BITS-1:0]];
+		empty_d <= empty;
 	end
 
-	reg [15:0] mem0_do, mem1_do;
-	always @(posedge clk) mem0_do <= mem0[sd_buff_addr];
-	always @(posedge clk) mem1_do <= mem1[sd_buff_addr];
-	wire [15:0] mem_do = (head == 1'b0) ? mem0_do : mem1_do;
-	// mem0/mem1 hold commit_buf_data, which is already in the internal
-	// SDRAM word convention (even source byte in the high half - see
-	// floppy_write_committer.v). hps_io's sd_buff_din/dout wire format is
-	// the opposite half-order (see floppy_loader.v's matching swap on the
-	// read side), so this swap must mirror that one or every written byte
-	// pair comes out transposed in the .dsk on disk.
-	assign sd_buff_din = {mem_do[7:0], mem_do[15:8]};
+	// the block buffer: filled from SDRAM, drained by hps_io
+	reg [15:0] blk [0:255];
+	reg        blk_we;
+	reg  [7:0] blk_wa;
+	reg [15:0] blk_wd;
+	always @(posedge clk) if (blk_we) blk[blk_wa] <= blk_wd;
 
-	localparam P_IDLE      = 2'd0,
-	           P_WAIT_ACK  = 2'd1,
-	           P_WAIT_DONE = 2'd2;
-	reg [1:0] pstate;
+	reg [15:0] blk_do;
+	always @(posedge clk) blk_do <= blk[sd_buff_addr];
+	// SDRAM words carry the even source byte in the high half; hps_io's wire
+	// format is the opposite (floppy_loader.v swaps the same way on the read side)
+	assign sd_buff_din = {blk_do[7:0], blk_do[15:8]};
 
-	// P_WAIT_ACK has no bound otherwise: if this slot's sd_wr is ever
-	// asserted while HPS isn't servicing it (framework quirk, a mount race
-	// on the shared slot, etc.) sd_ack never rises and this module would
-	// wedge in P_WAIT_ACK forever with busy stuck high (busy feeds
-	// LED_USER). ACK_TIMEOUT_BITS defaults to ~0.5s at clk_sys (~32MHz) -
-	// far longer than any real sd_ack latency, so it never fires in normal
-	// operation. On expiry the request is dropped and re-presented, NOT
-	// retired - see P_WAIT_ACK below for why abandoning the queue entry
-	// here would be a data-corruption path rather than a recovery.
+	localparam P_IDLE      = 3'd0,
+	           P_SKIP      = 3'd1,  // refused entry: one cycle for q_head to move on
+	           P_FILL      = 3'd2,  // fetching the block from SDRAM, word w
+	           P_WR        = 3'd3,  // block in the buffer: present sd_wr
+	           P_WAIT_ACK  = 3'd4,
+	           P_WAIT_DONE = 3'd5;
+	reg [2:0] pstate;
+
+	reg [12:0] cur_sec;    // the block being written
+	reg  [7:0] w;          // word index within it, during the fetch
+
+	// bound on P_WAIT_ACK: an sd_wr HPS never services is re-presented, not
+	// retired (see P_WAIT_ACK); ~0.5s, far beyond any real sd_ack latency
 	reg [ACK_TIMEOUT_BITS-1:0] ackTimer;
 	wire ackTimeout = &ackTimer;
 
-	wire [12:0] lba_head     = addr_q[head][21:9];
-	wire        lba_in_range = (size_blocks != 13'd0) && (lba_head < size_blocks);
+	wire lba_in_range = (size_blocks != 13'd0) && (q_head < size_blocks);
 
-	assign busy = (pstate != P_IDLE) || valid[0] || valid[1];
+	assign busy = (pstate != P_IDLE) || !empty;
 
 	always @(posedge clk) begin
+		blk_we <= 1'b0;
 		if (reset) begin
-			pstate <= P_IDLE;
-			sd_lba <= 32'd0;
-			sd_wr  <= 1'b0;
-			valid  <= 2'b00;
-			head   <= 1'b0;
-			tail   <= 1'b0;
-			ackTimer <= 0;
+			pstate     <= P_IDLE;
+			sd_lba     <= 32'd0;
+			sd_wr      <= 1'b0;
+			fetch_addr <= 22'd0;
+			fetch_req  <= 1'b0;
+			wr_ptr     <= 0;
+			rd_ptr     <= 0;
+			cur_sec    <= 13'd0;
+			w          <= 8'd0;
+			ackTimer   <= 0;
 		end else begin
-			// capture side: independent of pstate, always ready to accept
-			// the next commit (see header re: the depth-2 queue's limit).
-			if (commit_done && !readonly) begin
-				valid[tail]  <= 1'b1;
-				addr_q[tail] <= commit_addr;
-				tail         <= ~tail;
-			end
-
-			// Eject-race interlock: a fresh mount of THIS slot drops
-			// whatever is still queued (not yet started) - it was captured
-			// against the image that is now gone. Deliberately does NOT
-			// touch pstate/sd_wr/head: an sd_wr already mid-flight
-			// (P_WAIT_ACK/P_WAIT_DONE) keeps running exactly as it would
-			// otherwise, since tearing down a request hps_io may already
-			// be servicing is worse than letting one stale sector finish -
-			// only `valid` gates entry into a NEW P_IDLE->P_WAIT_ACK
-			// transition, so clearing it here can only stop sectors that
-			// have not started, never interrupt one that has. `tail` is
-			// rewound to `head` so the very next capture cannot land in
-			// whichever buffer is still draining (the same buffer-reuse
-			// idioms the depth-2 queue already documents above, not a new
-			// hazard).
-			if (img_mounted) begin
-				valid <= 2'b00;
-				tail  <= head;
-			end
+			// capture side: independent of pstate
+			if (push) wr_ptr <= wr_ptr + 1'd1;
 
 			case (pstate)
-			P_IDLE: if (valid[head] && !loader_busy) begin
-				// byte offset -> LBA (512B/sector). The decoder bounds-
-				// checks the SECTOR number against this track's spt, but
-				// nothing upstream checks the resulting LBA against the
-				// mounted image's actual length - `track` is free to reach
-				// 0x4F regardless of image size. This is the last place
-				// that can refuse, and it is cheap, so refuse here rather
-				// than hand hps_io an offset past the end of the file.
-				if (lba_in_range) begin
-					sd_lba <= {19'd0, lba_head};
-					sd_wr  <= 1'b1;
-					pstate <= P_WAIT_ACK;
-				end else begin
-					// out of range: retire without writing anything
-					valid[head] <= 1'b0;
-					head        <= ~head;
+			// q_head is valid once the queue has been non-empty for two cycles
+			P_IDLE: if (!empty && !empty_d && !loader_busy) begin
+				rd_ptr <= rd_ptr + 1'd1;
+				if (!lba_in_range)
+					// nothing upstream checks the LBA against the image length
+					pstate <= P_SKIP;
+				else begin
+					cur_sec <= q_head;
+					w       <= 8'd0;
+					pstate  <= P_FILL;
 				end
+			end
+
+			// a pop that stayed here would pop again against the stale head
+			P_SKIP: pstate <= P_IDLE;
+
+			// one word per slot-3 grant; addr and req change together and hold
+			P_FILL: if (!fetch_req) begin
+				fetch_addr <= {cur_sec, w, 1'b0};
+				fetch_req  <= 1'b1;
+			end else if (fetch_ack) begin
+				blk_we    <= 1'b1;
+				blk_wa    <= w;
+				blk_wd    <= fetch_data;
+				fetch_req <= 1'b0;
+				w         <= w + 8'd1;
+				if (w == 8'd255) pstate <= P_WR;
+			end
+
+			P_WR: begin
+				sd_lba <= {19'd0, cur_sec};
+				sd_wr  <= 1'b1;
+				pstate <= P_WAIT_ACK;
 			end
 
 			P_WAIT_ACK: if (sd_ack) begin
 				sd_wr  <= 1'b0; // mirrors scsi.v: io_wr drops as soon as io_ack rises
 				pstate <= P_WAIT_DONE;
 			end else if (ackTimeout) begin
-				// Drop the request and RE-PRESENT it - deliberately without
-				// clearing valid[head] or advancing `head`. Retiring the
-				// entry here is not safe: hps_io captures sd_lba during its
-				// own poll command and raises sd_ack in a LATER, separate
-				// command, so there is no bound on the gap between the two.
-				// If the entry were retired and `head` flipped, a late
-				// sd_ack would stream the OTHER buffer out to the LBA the
-				// HPS had already captured - a full sector of unrelated
-				// data written at a perfectly valid offset in the .dsk.
-				// Leaving head/valid/sd_lba alone makes the retry idempotent
-				// instead: however late the ack arrives, and whichever
-				// attempt it belongs to, it transfers the same buffer to the
-				// same LBA. `busy` stays high while a write is genuinely
-				// still owed, which is what the LED should show anyway.
+				// re-present the SAME block: hps_io captures sd_lba in one poll
+				// and acks in a later one, so a retired entry plus a late ack
+				// would stream the next block to the captured LBA
 				sd_wr  <= 1'b0;
-				pstate <= P_IDLE;
+				pstate <= P_WR;
 			end else
 				ackTimer <= ackTimer + 1'b1;
 
-			P_WAIT_DONE: if (!sd_ack) begin
-				valid[head] <= 1'b0;
-				head        <= ~head;
-				pstate      <= P_IDLE;
-			end
+			P_WAIT_DONE: if (!sd_ack) pstate <= P_IDLE;
 
 			default: pstate <= P_IDLE;
 			endcase
 
 			if (pstate != P_WAIT_ACK) ackTimer <= 0;
+
+			// remount abort, after the case so it wins this cycle
+			if (img_mounted) begin
+				wr_ptr    <= 0;
+				rd_ptr    <= 0;
+				sd_wr     <= 1'b0;
+				fetch_req <= 1'b0;
+				blk_we    <= 1'b0;
+				pstate    <= P_IDLE;
+			end
 		end
 	end
 

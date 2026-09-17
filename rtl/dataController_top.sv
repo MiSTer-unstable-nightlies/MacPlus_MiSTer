@@ -105,17 +105,11 @@ module dataController_top(
 	output        dskWriteReqExt,
 	input         dskWriteAckExt,
 
-	// SD persistence tap, per drive - see iwm.v's dskCommit* ports
+	// commit notice, per drive - see iwm.v's dskCommit* ports
 	output        dskCommitDoneInt,
 	output [21:0] dskCommitAddrInt,
-	output        dskCommitBufWrInt,
-	output [7:0]  dskCommitBufAddrInt,
-	output [15:0] dskCommitBufDataInt,
 	output        dskCommitDoneExt,
 	output [21:0] dskCommitAddrExt,
-	output        dskCommitBufWrExt,
-	output [7:0]  dskCommitBufAddrExt,
-	output [15:0] dskCommitBufDataExt,
 
 	// connections to io controller
 	input   [SCSI_DEVS-1:0] img_mounted,
@@ -540,14 +534,8 @@ module dataController_top(
 
 		.dskCommitDoneInt(dskCommitDoneInt),
 		.dskCommitAddrInt(dskCommitAddrInt),
-		.dskCommitBufWrInt(dskCommitBufWrInt),
-		.dskCommitBufAddrInt(dskCommitBufAddrInt),
-		.dskCommitBufDataInt(dskCommitBufDataInt),
 		.dskCommitDoneExt(dskCommitDoneExt),
 		.dskCommitAddrExt(dskCommitAddrExt),
-		.dskCommitBufWrExt(dskCommitBufWrExt),
-		.dskCommitBufAddrExt(dskCommitBufAddrExt),
-		.dskCommitBufDataExt(dskCommitBufDataExt),
 
 		.dcd_sd_lba(dcd_sd_lba),
 		.dcd_sd_rd(dcd_sd_rd),

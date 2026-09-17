@@ -108,10 +108,7 @@ module floppy
 
 	// SD persistence tap, mirrors the SDRAM commit for floppy_sd_writer
 	output        dskCommitDone,   // one clk pulse: sector fully committed to SDRAM
-	output [21:0] dskCommitAddr,   // image byte offset of sector byte 0, valid at dskCommitDone
-	output        dskCommitBufWr,
-	output [7:0]  dskCommitBufAddr,
-	output [15:0] dskCommitBufData
+	output [21:0] dskCommitAddr    // image byte offset of sector byte 0, valid at dskCommitDone
 );
 
 	assign motor = ~driveRegs[`DRIVE_REG_MOTORON];
@@ -341,11 +338,7 @@ module floppy
 
 		.busy         (  ),
 		.done         ( dskCommitDone ),
-		.committed_addr ( dskCommitAddr ),
-
-		.sd_buf_addr  ( dskCommitBufAddr ),
-		.sd_buf_data  ( dskCommitBufData ),
-		.sd_buf_wr    ( dskCommitBufWr )
+		.committed_addr ( dskCommitAddr )
 	);
 	
 	wire [3:0] driveReadAddr = {ca2,ca1,ca0,SEL};
