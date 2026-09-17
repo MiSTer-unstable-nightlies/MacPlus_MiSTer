@@ -74,7 +74,18 @@ module addrController_top(
 	output dskLoadAckExt,
 	output dskLoadWrEn,
 	// held for the whole grant cycle; MacPlus.sv muxes the write data on this
-	output dskLoadSelExt
+	output dskLoadSelExt,
+
+	// floppy_sd_writer read port on the same slot, below both write requests;
+	// same protocol, and sdram.v has the word in dout from the end of
+	// busPhase 2, so the requester captures it on the ack edge
+	input [21:0] dskFetchAddrInt,
+	input dskFetchReqInt,
+	output dskFetchAckInt,
+	input [21:0] dskFetchAddrExt,
+	input dskFetchReqExt,
+	output dskFetchAckExt,
+	output dskLoadRdEn
 );
 
 	// -------------- audio engine ---------------
@@ -227,9 +238,12 @@ module addrController_top(
 	// so the loader requests are sampled once at the cycle boundary, the grant
 	// held for the whole cycle, and the ack pulsed late in busPhase 3
 	reg dskLoadReqIntR, dskLoadReqExtR;
+	reg dskFetchReqIntR, dskFetchReqExtR;
 	always @(posedge clk) if (busPhase == 2'b11) begin
-		dskLoadReqIntR <= dskLoadReqInt;
-		dskLoadReqExtR <= dskLoadReqExt;
+		dskLoadReqIntR  <= dskLoadReqInt;
+		dskLoadReqExtR  <= dskLoadReqExt;
+		dskFetchReqIntR <= dskFetchReqInt;
+		dskFetchReqExtR <= dskFetchReqExt;
 	end
 
 	assign dskLoadSelExt = ~dskLoadReqIntR & dskLoadReqExtR;
@@ -239,11 +253,22 @@ module addrController_top(
 	assign dskLoadAckExt = dskLoadAck &  dskLoadSelExt;
 	assign dskLoadWrEn   = dskLoadGrant;
 
+	// reads take the slot only when neither write request has it; every term
+	// is a busPhase-3 register, so the choice holds for the whole cycle
+	wire dskFetchSelExt  = ~dskFetchReqIntR & dskFetchReqExtR;
+	wire dskFetchGrant   = (extraBusControl == 1'b1) && (extra_slot_count == 3) &&
+	                       ~(dskLoadReqIntR | dskLoadReqExtR) && (dskFetchReqIntR | dskFetchReqExtR);
+	wire dskFetchAck     = dskFetchGrant && (busPhase == 2'b11);
+	assign dskFetchAckInt = dskFetchAck & ~dskFetchSelExt;
+	assign dskFetchAckExt = dskFetchAck &  dskFetchSelExt;
+	assign dskLoadRdEn    = dskFetchGrant;
+
 	// byte offsets of each floppy image within the disk region (rtl/sdram_map.vh)
 	assign memoryAddr =
 		dskReadAckInt ? dskReadAddrInt + `DSK_INT_BYTE_OFF:   // first dsk image at 1MB
 		dskReadAckExt ? dskReadAddrExt + `DSK_EXT_BYTE_OFF:   // second dsk image at 2MB
 		dskLoadGrant  ? (dskLoadSelExt ? dskLoadAddrExt + `DSK_EXT_BYTE_OFF : dskLoadAddrInt + `DSK_INT_BYTE_OFF) :
+		dskFetchGrant ? (dskFetchSelExt ? dskFetchAddrExt + `DSK_EXT_BYTE_OFF : dskFetchAddrInt + `DSK_INT_BYTE_OFF) :
 		macAddr;
 
 	// address decoding

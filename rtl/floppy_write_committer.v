@@ -29,12 +29,8 @@
 // recovers the original byte order.
 //
 // This module is SDRAM-only - no sd_wr here. Persistence to the mounted
-// .dsk is floppy_sd_writer.v, which taps this module's ASSERT-state word
-// stream (below)
-// rather than re-reading the decoder's buf_mem through a second port -
-// floppy_track_decoder.v's buf_mem is a Simple Dual Port BRAM (one write,
-// one read), so
-// there is no second read port to give a persistence module of its own.
+// .dsk is floppy_sd_writer.v, which queues the sector number on `done` and
+// fetches the block back out of SDRAM at write time.
 //
 // Sector-to-sector spacing on real media (~16ms at 12 sectors/revolution)
 // comfortably exceeds this module's own drain time (256 words at ~2us/slot
@@ -60,25 +56,10 @@ module floppy_write_committer
 
 	output            busy,
 	output reg        done,        // one clk pulse: sector fully committed to SDRAM
-	output     [21:0] committed_addr, // = base_addr; stable from capture through `done`
-
-	// Persistence tap: mirrors every word as it is written to SDRAM (same
-	// address/data/timing as wr_addr/wr_data/wr_req above), so a
-	// persistence module can build a byte-exact shadow of the sector
-	// without touching the decoder's single read port. wr_req is level-
-	// true for however many cycles WAIT takes to see wr_ack - re-writing
-	// the same (word_idx, wr_data) to a shadow buffer on every one of
-	// those cycles is harmless, so this is a plain wire tap, not a state
-	// machine of its own.
-	output      [7:0] sd_buf_addr,
-	output     [15:0] sd_buf_data,
-	output             sd_buf_wr
+	output     [21:0] committed_addr  // = base_addr; stable from capture through `done`
 );
 
 	assign committed_addr = base_addr;
-	assign sd_buf_addr    = word_idx;
-	assign sd_buf_data    = wr_data;
-	assign sd_buf_wr      = wr_req;
 
 localparam IDLE       = 3'd0,
            FETCH_LO   = 3'd1,
